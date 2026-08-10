@@ -2,7 +2,7 @@
 
 An agentic robotic manipulation framework built with **ManiSkill**, **Panda Wrist RGB-D Camera**, **Qwen3-VL**, and **GraspNet**.
 
-![demo](./asserts/demo.png)
+![demo](./demo.png)
 
 ==Demo video is here:==
 
