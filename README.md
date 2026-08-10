@@ -2,6 +2,12 @@
 
 An agentic robotic manipulation framework built with **ManiSkill**, **Panda Wrist RGB-D Camera**, **Qwen3-VL**, and **GraspNet**.
 
+![demo](./asserts/demo.png)
+
+==Demo video is here:==
+
+**https://www.bilibili.com/video/BV1sPuU6TEi1/ **
+
 The system implements a closed-loop manipulation pipeline in which a vision-language model interprets natural-language instructions and visual observations, GraspNet predicts 6-DoF grasp poses from RGB-D observations, and the robotics runtime executes and verifies manipulation actions inside ManiSkill.
 
 ## Overview
