@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-manipulation"
+version = "0.1.0"
+description = "Closed-loop ManiSkill manipulation with Qwen3-VL and GraspNet"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=2.0",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+simulation = ["mani-skill==3.0.1", "sapien==3.0.3"]
+models = ["torch>=2.5"]
+voice = ["faster-whisper>=1.1"]
+test = ["pytest>=8.4"]
+
+[project.scripts]
+agentic-manipulation = "agentic_manipulation.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "assets: requires explicitly downloaded ManiSkill assets",
+    "real_models: requires a running Ollama service and real GraspNet checkpoint",
+]
