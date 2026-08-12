@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 from typing import Protocol
@@ -13,8 +13,8 @@ from PIL import Image, ImageDraw
 
 from agentic_manipulation.config import RuntimeConfig
 from agentic_manipulation.control.panda_atomic import (
-    AtomicPickReport,
-    AtomicPlaceReport,
+    AtomicTransferPlan,
+    AtomicTransferReport,
 )
 from agentic_manipulation.demo.panda_calibration import compose_panda_world_ee
 from agentic_manipulation.envs.ee_camera_scene import (
@@ -24,22 +24,25 @@ from agentic_manipulation.envs.ee_camera_scene import (
 from agentic_manipulation.errors import (
     AgenticManipulationError,
     GraspNetUnavailableError,
+    MotionStageError,
     SemanticValidationError,
 )
 from agentic_manipulation.models.graspnet import GraspProvider
+from agentic_manipulation.perception.depth_segmentation import DepthRegion, segment_depth
 from agentic_manipulation.perception.pointcloud import (
     backproject_camera,
     crop_local_workspace_camera,
-    match_instance,
 )
 from agentic_manipulation.perception.depth import depth_grayscale_rgb
 from agentic_manipulation.runtime.artifacts import ArtifactWriter
 from agentic_manipulation.runtime.semantics import ResolvedAction
 from agentic_manipulation.types import (
+    BBox,
     CameraFrame,
     GroundedAction,
     PlannedTask,
     PlanningEval,
+    RegionClassification,
     RuntimeEvent,
     RuntimeEventType,
     RuntimeResult,
@@ -76,18 +79,6 @@ _OBJECT_ALIASES = {
         "紫方块",
         "紫色长方体",
     ),
-    "green_cylinder": (
-        "green cylinder",
-        "绿色圆柱",
-        "绿圆柱",
-        "绿色圆柱体",
-    ),
-    "orange_cylinder": (
-        "orange cylinder",
-        "橙色圆柱",
-        "橙圆柱",
-        "橙色圆柱体",
-    ),
 }
 _DESTINATION_ALIASES = {
     "white_bin": (
@@ -116,7 +107,44 @@ _DESTINATION_ALIASES = {
 _ALL_QUANTIFIERS = ("all", "every", "所有", "全部", "每个", "每一个")
 _ALL_OBJECT_GROUPS = ("all objects", "every object", "所有物体", "全部物体", "所有对象")
 _BLOCK_GROUPS = ("cubes", "cube", "blocks", "block", "方块", "立方体", "长方体")
-_CYLINDER_GROUPS = ("cylinders", "cylinder", "圆柱", "圆柱体")
+_FOUR_OBJECT_GROUPS = (
+    "four objects",
+    "four items",
+    "4 objects",
+    "4 items",
+    "四个物体",
+    "四个物品",
+    "4个物体",
+    "4个物品",
+)
+_ANY_DESTINATION_GROUPS = (
+    "any bin",
+    "any box",
+    "either bin",
+    "任意盒子",
+    "任意一个盒子",
+    "任何盒子",
+    "任一盒子",
+    "任意箱子",
+)
+_SCENE_INSTANCE_CATALOG = {
+    label: label
+    for label in GRASPABLE_INSTANCE_IDS + DESTINATION_INSTANCE_IDS
+}
+_TARGET_RGB_REFERENCES = {
+    "red_cube": np.array([230.0, 31.0, 26.0]),
+    "blue_cube": np.array([26.0, 77.0, 230.0]),
+    "yellow_block": np.array([242.0, 191.0, 20.0]),
+    "purple_block": np.array([140.0, 51.0, 191.0]),
+}
+_TARGET_RGB_MAX_DISTANCE = {
+    "red_cube": 90.0,
+    "blue_cube": 90.0,
+    "yellow_block": 70.0,
+    "purple_block": 90.0,
+}
+_MIN_TARGET_PLACE_PIXELS = 20
+_MIN_TARGET_INSIDE_RATIO = 0.8
 
 
 def _semantic_text(value: object) -> str:
@@ -168,12 +196,8 @@ def _target_mention_position(command: str, target: str) -> int | None:
     )
     if specific is not None:
         return specific
-    if target in GRASPABLE_INSTANCE_IDS[:4]:
+    if target in GRASPABLE_INSTANCE_IDS:
         grouped = _first_alias_position(text, _BLOCK_GROUPS)
-        if grouped is not None:
-            return grouped
-    if target in GRASPABLE_INSTANCE_IDS[4:]:
-        grouped = _first_alias_position(text, _CYLINDER_GROUPS)
         if grouped is not None:
             return grouped
     return _first_alias_position(text, _ALL_OBJECT_GROUPS)
@@ -185,14 +209,14 @@ def _requested_targets(
 ) -> tuple[str, ...]:
     text = _semantic_text(command)
     requested = set(_labels_in_text(command, _OBJECT_ALIASES))
-    if _has_any(text, _ALL_QUANTIFIERS):
+    if _has_any(text, _FOUR_OBJECT_GROUPS):
+        requested.update(GRASPABLE_INSTANCE_IDS)
+    elif _has_any(text, _ALL_QUANTIFIERS):
         if _has_any(text, _ALL_OBJECT_GROUPS):
             requested.update(GRASPABLE_INSTANCE_IDS)
         else:
             if _has_any(text, _BLOCK_GROUPS):
-                requested.update(GRASPABLE_INSTANCE_IDS[:4])
-            if _has_any(text, _CYLINDER_GROUPS):
-                requested.update(GRASPABLE_INSTANCE_IDS[4:])
+                requested.update(GRASPABLE_INSTANCE_IDS)
     return tuple(
         label
         for label in GRASPABLE_INSTANCE_IDS
@@ -211,17 +235,31 @@ def _canonical_task(step: int, target: str, destination: str) -> PlannedTask:
 def canonicalize_panda_plan(
     command: str,
     plan: PlanningEval,
-    visible_instances: Mapping[str, str],
+    perceived_catalog: Mapping[str, str],
 ) -> PlanningEval:
     """Normalize common Chinese/English aliases and expand quantified groups."""
 
     visible_graspables = {
-        label for label in GRASPABLE_INSTANCE_IDS if label in visible_instances
+        label for label in GRASPABLE_INSTANCE_IDS if label in perceived_catalog
     }
     requested = _requested_targets(command, visible_graspables)
     destination_mentions = _destination_mentions(command)
     command_destinations = tuple(dict.fromkeys(label for _, label in destination_mentions))
-    if requested and destination_mentions:
+    visible_destinations = tuple(
+        label
+        for label in DESTINATION_INSTANCE_IDS
+        if label in perceived_catalog
+    )
+    if (
+        requested
+        and _has_any(_semantic_text(command), _ANY_DESTINATION_GROUPS)
+        and visible_destinations
+    ):
+        assignments = [
+            (target, visible_destinations[index % len(visible_destinations)])
+            for index, target in enumerate(requested)
+        ]
+    elif requested and destination_mentions:
         assignments = []
         for target in requested:
             target_position = _target_mention_position(command, target)
@@ -270,25 +308,16 @@ def canonicalize_panda_plan(
 class PandaScene(Protocol):
     def capture(self) -> CameraFrame: ...
 
-    def visible_instances(self) -> Mapping[str, str]: ...
-
-    def segmentation_ids(self) -> Mapping[int, str]: ...
-
-    def is_grasping(self, instance_id: str) -> bool: ...
-
-    def is_in_bin(self, instance_id: str, bin_id: str) -> bool: ...
-
-    def is_released(self, instance_id: str) -> bool: ...
-
-    def is_stable(self, instance_id: str) -> bool: ...
-
-
 class PandaVLM(Protocol):
     def evaluate_doable(self, command: str, frame: CameraFrame): ...
 
     def plan(self, command: str, frame: CameraFrame): ...
 
     def ground(self, command: str, task: object, frame: CameraFrame): ...
+
+    def classify_regions(
+        self, frame: CameraFrame, region_bboxes: Sequence[BBox]
+    ) -> tuple[RegionClassification, ...]: ...
 
     def check_grasp(
         self, command: str, task: object, grounded: GroundedAction, frame: CameraFrame
@@ -299,60 +328,134 @@ class PandaVLM(Protocol):
     ): ...
 
 
+@dataclass(frozen=True)
+class _RegionGeometry:
+    point_count: int
+    center_camera_m: tuple[float, float, float]
+    center_world_m: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class _RGBPlaceEvidence:
+    status: bool | None
+    target_pixel_count: int
+    inside_pixel_count: int
+    inside_ratio: float
+
+
+def _rgb_target_inside_destination(
+    rgb: np.ndarray, target_label: str, destination_bbox: BBox
+) -> _RGBPlaceEvidence:
+    """Check target-color concentration in a destination using RGB only."""
+    image = np.asarray(rgb, dtype=np.float64)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise SemanticValidationError("place RGB image must have shape (H, W, 3)")
+    try:
+        reference = _TARGET_RGB_REFERENCES[target_label]
+    except KeyError as exc:
+        raise SemanticValidationError(
+            f"no RGB reference for target {target_label}"
+        ) from exc
+    color_distance = np.linalg.norm(image - reference, axis=2)
+    target_mask = color_distance <= _TARGET_RGB_MAX_DISTANCE[target_label]
+    target_pixel_count = int(np.count_nonzero(target_mask))
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = destination_bbox.as_pixels(width, height)
+    inside_pixel_count = int(np.count_nonzero(target_mask[y1:y2, x1:x2]))
+    inside_ratio = (
+        inside_pixel_count / target_pixel_count if target_pixel_count else 0.0
+    )
+    status = None
+    if target_pixel_count >= _MIN_TARGET_PLACE_PIXELS:
+        status = inside_ratio >= _MIN_TARGET_INSIDE_RATIO
+    return _RGBPlaceEvidence(
+        status=status,
+        target_pixel_count=target_pixel_count,
+        inside_pixel_count=inside_pixel_count,
+        inside_ratio=inside_ratio,
+    )
+
+
+def _region_geometry(
+    frame: CameraFrame, regions: Sequence[DepthRegion]
+) -> tuple[_RegionGeometry, ...]:
+    """Reconstruct a calibrated 3D center for every depth region."""
+    transform = np.asarray(frame.world_from_camera, dtype=np.float64)
+    result = []
+    for region in regions:
+        points_camera = backproject_camera(
+            frame, region.bbox, pixel_mask=region.mask
+        ).astype(np.float64, copy=False)
+        if len(points_camera) == 0:
+            raise SemanticValidationError("depth region point cloud is empty")
+        homogeneous = np.column_stack(
+            (points_camera, np.ones(len(points_camera), dtype=np.float64))
+        )
+        points_world = (transform @ homogeneous.T).T[:, :3]
+        center_camera = np.median(points_camera, axis=0)
+        center_world = np.median(points_world, axis=0)
+        result.append(
+            _RegionGeometry(
+                point_count=len(points_camera),
+                center_camera_m=tuple(float(value) for value in center_camera),
+                center_world_m=tuple(float(value) for value in center_world),
+            )
+        )
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class _RegionPerception:
+    frame: CameraFrame
+    regions: tuple[DepthRegion, ...]
+    inventory: tuple[RegionClassification, ...]
+    geometry: tuple[_RegionGeometry, ...]
+    annotated_rgb: np.ndarray
+
+    def vlm_frame(self) -> CameraFrame:
+        return CameraFrame(
+            rgb=self.annotated_rgb.copy(),
+            depth_m=self.frame.depth_m.copy(),
+            intrinsic=self.frame.intrinsic.copy(),
+            world_from_camera=self.frame.world_from_camera.copy(),
+            segmentation=None,
+            timestamp=self.frame.timestamp,
+        )
+
+    def command_context(self, command: str) -> str:
+        rows = []
+        for region, item, geometry in zip(
+            self.regions, self.inventory, self.geometry, strict=True
+        ):
+            rows.append(
+                f"R{item.region_id}: color={item.color}, kind={item.kind}, "
+                f"label={item.label}, image_location={item.image_location}, "
+                f"center_xy_norm={np.round(region.centroid_norm, 4).tolist()}, "
+                f"center_camera_m={np.round(geometry.center_camera_m, 4).tolist()}, "
+                f"center_world_m={np.round(geometry.center_world_m, 4).tolist()}"
+            )
+        return command + "\nCurrent RGB-D region inventory:\n" + "\n".join(rows)
+
+
 class PandaAtomicSkill(Protocol):
-    def pick(self, instance_id: str, world_from_ee: np.ndarray) -> AtomicPickReport: ...
+    def can_pick(self, world_from_ee: np.ndarray) -> bool: ...
+
+    def plan_transfer(
+        self,
+        world_from_ee: np.ndarray,
+        nominal_world_from_release: np.ndarray,
+    ) -> AtomicTransferPlan: ...
+
+    def execute(
+        self,
+        instance_id: str,
+        plan: AtomicTransferPlan,
+        confirm_grasp: Callable[[], bool],
+    ) -> AtomicTransferReport: ...
 
     def recover_after_failed_pick(self) -> None: ...
 
-    def place(self, instance_id: str, bin_id: str) -> AtomicPlaceReport: ...
-
     def return_home(self) -> None: ...
-
-
-def annotated_grounding_frame(
-    frame: CameraFrame, segmentation_ids: Mapping[int, str]
-) -> CameraFrame:
-    """Overlay authoritative simulator instance labels for VLM grounding."""
-
-    if frame.segmentation is None:
-        raise SemanticValidationError("grounding overlay requires segmentation")
-    image = Image.fromarray(frame.rgb.copy(), mode="RGB")
-    draw = ImageDraw.Draw(image)
-    colors = (
-        (255, 230, 40),
-        (40, 255, 100),
-        (255, 90, 220),
-        (80, 220, 255),
-        (255, 140, 40),
-        (180, 100, 255),
-        (255, 255, 255),
-        (255, 80, 120),
-    )
-    for index, (segmentation_id, instance_id) in enumerate(
-        sorted(segmentation_ids.items())
-    ):
-        rows, columns = np.nonzero(frame.segmentation == segmentation_id)
-        if len(rows) == 0:
-            continue
-        box = (
-            int(columns.min()),
-            int(rows.min()),
-            int(columns.max()),
-            int(rows.max()),
-        )
-        color = colors[index % len(colors)]
-        draw.rectangle(box, outline=color, width=2)
-        text_box = draw.textbbox((box[0], box[1]), instance_id)
-        draw.rectangle(text_box, fill=(0, 0, 0))
-        draw.text((box[0], box[1]), instance_id, fill=color)
-    return CameraFrame(
-        rgb=np.asarray(image, dtype=np.uint8),
-        depth_m=frame.depth_m,
-        intrinsic=frame.intrinsic,
-        world_from_camera=frame.world_from_camera,
-        segmentation=frame.segmentation,
-        timestamp=frame.timestamp,
-    )
 
 
 def grounding_selection_frame(
@@ -437,34 +540,8 @@ def grasp_prediction_frame(
     return np.asarray(image, dtype=np.uint8)
 
 
-def grounding_bbox_catalog(
-    frame: CameraFrame, segmentation_ids: Mapping[int, str]
-) -> str:
-    """Return exact visible instance boxes for the VLM to select and echo."""
-
-    if frame.segmentation is None:
-        raise SemanticValidationError("grounding catalog requires segmentation")
-    height, width = frame.segmentation.shape
-    entries = []
-    for segmentation_id, instance_id in sorted(segmentation_ids.items()):
-        rows, columns = np.nonzero(frame.segmentation == segmentation_id)
-        if len(rows) == 0:
-            continue
-        coordinates = (
-            columns.min() / width,
-            rows.min() / height,
-            (columns.max() + 1) / width,
-            (rows.max() + 1) / height,
-        )
-        entries.append(
-            f"{instance_id}=[{coordinates[0]:.4f},{coordinates[1]:.4f},"
-            f"{coordinates[2]:.4f},{coordinates[3]:.4f}]"
-        )
-    return "Authoritative simulator bbox_xyxy_norm catalog: " + "; ".join(entries)
-
-
 def validate_panda_plan(
-    plan: PlanningEval, visible_instances: Mapping[str, str]
+    plan: PlanningEval, perceived_catalog: Mapping[str, str]
 ) -> None:
     if not plan.tasks:
         raise SemanticValidationError("planning returned no tasks")
@@ -474,7 +551,12 @@ def validate_panda_plan(
     visible_graspables = {
         instance_id
         for instance_id in GRASPABLE_INSTANCE_IDS
-        if instance_id in visible_instances
+        if instance_id in perceived_catalog
+    }
+    visible_destinations = {
+        instance_id
+        for instance_id in DESTINATION_INSTANCE_IDS
+        if instance_id in perceived_catalog
     }
     if len(plan.tasks) > len(visible_graspables):
         raise SemanticValidationError(
@@ -489,7 +571,7 @@ def validate_panda_plan(
         }
         destinations = {
             label
-            for label in DESTINATION_INSTANCE_IDS
+            for label in visible_destinations
             if re.search(rf"(?<![A-Za-z0-9_]){re.escape(label)}(?![A-Za-z0-9_])", task.action)
         }
         if len(targets) != 1:
@@ -519,8 +601,6 @@ def atomic_subtask_context(task: object) -> str:
 
 def resolve_panda_action(
     grounded: GroundedAction,
-    frame: CameraFrame,
-    segmentation_ids: Mapping[int, str],
     used_targets: set[str],
 ) -> ResolvedAction:
     if grounded.destination_label not in DESTINATION_INSTANCE_IDS:
@@ -533,20 +613,8 @@ def resolve_panda_action(
         )
     if grounded.destination_bbox is None:
         raise SemanticValidationError("Panda destination bbox is required")
-    if frame.segmentation is None:
-        raise SemanticValidationError("Panda grounding requires segmentation")
-    target = match_instance(grounded.target_bbox, frame.segmentation, segmentation_ids)
-    if target != grounded.target_label:
-        raise SemanticValidationError(
-            f"target bbox resolves to {target}, not {grounded.target_label}"
-        )
-    destination = match_instance(
-        grounded.destination_bbox, frame.segmentation, segmentation_ids
-    )
-    if destination != grounded.destination_label:
-        raise SemanticValidationError(
-            f"destination bbox resolves to {destination}, not {grounded.destination_label}"
-        )
+    target = grounded.target_label
+    destination = grounded.destination_label
     if target in used_targets:
         raise SemanticValidationError(f"target was already completed: {target}")
     return ResolvedAction(
@@ -560,14 +628,66 @@ def resolve_panda_action(
     )
 
 
+def _task_labels(task: object) -> tuple[str, str]:
+    """Extract canonical target and destination labels from a *task* action.
+
+    The action is assumed to contain exactly one target label from
+    ``GRASPABLE_INSTANCE_IDS`` and one destination label from
+    ``DESTINATION_INSTANCE_IDS``.
+    """
+    action_text = getattr(task, "action", "")
+    target = ""
+    destination = ""
+    for label in GRASPABLE_INSTANCE_IDS:
+        if label in action_text:
+            target = label
+            break
+    for label in DESTINATION_INSTANCE_IDS:
+        if label in action_text:
+            destination = label
+            break
+    if not target or not destination:
+        raise SemanticValidationError(
+            f"cannot extract target/destination labels from task: {action_text!r}"
+        )
+    return target, destination
+
+
+def _draw_depth_regions(
+    rgb: np.ndarray, labeled: list[tuple[BBox, str]]
+) -> np.ndarray:
+    """Draw coloured bounding boxes and labels for depth-segmented regions."""
+    image = Image.fromarray(rgb.copy(), mode="RGB")
+    draw = ImageDraw.Draw(image)
+    colors = (
+        (255, 230, 40), (40, 255, 100), (255, 90, 220),
+        (80, 220, 255), (255, 140, 40), (180, 100, 255),
+        (255, 255, 255), (255, 80, 120),
+    )
+    height, width = rgb.shape[:2]
+    for idx, (bbox, label) in enumerate(labeled):
+        color = colors[idx % len(colors)]
+        x1, y1, x2, y2 = bbox.as_pixels(width, height)
+        draw.rectangle((x1, y1, max(x1, x2 - 1), max(y1, y2 - 1)),
+                       outline=color, width=2)
+        text_box = draw.textbbox((x1, y1), label)
+        draw.rectangle(text_box, fill=(0, 0, 0))
+        draw.text((x1, y1), label, fill=color)
+    return np.asarray(image, dtype=np.uint8)
+
+
 def _select_camera_grasp(
     candidates: object,
     target_points_camera: object,
     world_from_camera: object,
     *,
-    target_instance_id: str | None = None,
+    target_bbox: BBox,
+    intrinsic: object,
+    image_hw: tuple[int, int],
+    reachable: Callable[[np.ndarray], bool],
     candidate_index: int = 0,
 ):
+    """Return an in-box, reachable GraspNet candidate, preferring verticality."""
     target = np.asarray(target_points_camera, dtype=np.float64)
     if (
         target.ndim != 2
@@ -584,60 +704,211 @@ def _select_camera_grasp(
         or candidate_index < 0
     ):
         raise GraspNetUnavailableError("candidate_index must be nonnegative")
-    association_margin_m = 0.035
-    boxlike_ids = {"red_cube", "blue_cube", "yellow_block", "purple_block"}
-    max_tilt_from_vertical_deg = (
-        60.0 if target_instance_id in boxlike_ids else 75.0
-    )
-    preferred_vertical_deg = 20.0
-    min_down_alignment = float(
-        np.cos(np.deg2rad(max_tilt_from_vertical_deg))
-    )
-    target_low = np.min(target, axis=0) - association_margin_m
-    target_high = np.max(target, axis=0) + association_margin_m
-    ranked = []
+
+    transform = np.asarray(world_from_camera, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise GraspNetUnavailableError(
+            "world_from_camera must be a finite 4x4 matrix"
+        )
+    camera_intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    if camera_intrinsic.shape != (3, 3) or not np.isfinite(camera_intrinsic).all():
+        raise GraspNetUnavailableError("intrinsic must be a finite 3x3 matrix")
+    if (
+        not isinstance(image_hw, tuple)
+        or len(image_hw) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+               for value in image_hw)
+    ):
+        raise GraspNetUnavailableError("image_hw must contain two positive integers")
+    if not isinstance(target_bbox, BBox):
+        raise GraspNetUnavailableError("target_bbox must be a normalized BBox")
+    if not callable(reachable):
+        raise GraspNetUnavailableError("reachable must be callable")
+    height, width = image_hw
+    bbox_x1, bbox_y1, bbox_x2, bbox_y2 = target_bbox.as_pixels(width, height)
+
+    target_low = np.min(target, axis=0) - 0.035
+    target_high = np.max(target, axis=0) + 0.035
+    target_center = np.median(target, axis=0)
+    max_predicted_width_m = 0.085
+    max_tilt_from_vertical_deg = 60.0
+    min_acceptable = float(np.cos(np.deg2rad(max_tilt_from_vertical_deg)))
+
+    ranked: list[tuple[float, float, float, object]] = []
     for candidate in candidates:
-        position = np.asarray(candidate.world_from_gripper[:3, 3], dtype=np.float64)
-        if not candidate.collision_free or candidate.width_m > 0.081:
+        if (
+            not candidate.collision_free
+            or candidate.width_m > max_predicted_width_m
+        ):
             continue
-        if not np.all((position >= target_low) & (position <= target_high)):
+        camera_position = np.asarray(
+            candidate.world_from_gripper[:3, 3], dtype=np.float64
+        )
+        if not np.all((camera_position >= target_low) & (camera_position <= target_high)):
+            continue
+        projected = _project_camera_point(camera_position, camera_intrinsic)
+        if projected is None:
+            continue
+        u, v = projected
+        projection_epsilon_px = 1e-6
+        if not (
+            bbox_x1 - projection_epsilon_px <= u < bbox_x2 + projection_epsilon_px
+            and bbox_y1 - projection_epsilon_px <= v < bbox_y2 + projection_epsilon_px
+        ):
             continue
         world_from_ee = compose_panda_world_ee(
-            world_from_camera, candidate.world_from_gripper
+            transform, candidate.world_from_gripper
         )
-        tool_axis = world_from_ee[:3, 2]
+        if not reachable(world_from_ee):
+            continue
+        tool_axis = np.asarray(
+            world_from_ee[:3, 2], dtype=np.float64
+        )
         norm = float(np.linalg.norm(tool_axis))
         if norm == 0:
             continue
         down_alignment = -float(tool_axis[2] / norm)
-        if down_alignment < min_down_alignment:
+        if down_alignment < min_acceptable:
             continue
-        tilt_angle_deg = float(
-            np.rad2deg(np.arccos(np.clip(down_alignment, -1.0, 1.0)))
-        )
-        target_center_distance = float(
-            np.linalg.norm(position - np.mean(target, axis=0))
-        )
-        ranked.append(
-            (
-                0 if tilt_angle_deg <= preferred_vertical_deg else 1,
-                -float(candidate.score),
-                tilt_angle_deg,
-                target_center_distance,
-                candidate,
-            )
-        )
-    ranked.sort(key=lambda item: item[:4])
+        tilt_deg = float(np.rad2deg(np.arccos(np.clip(down_alignment, -1.0, 1.0))))
+        center_distance = float(np.linalg.norm(camera_position - target_center))
+        ranked.append((tilt_deg, center_distance, -float(candidate.score), candidate))
+
     if not ranked:
         raise GraspNetUnavailableError(
-            "no target-associated, collision-free Panda grasp satisfies the "
-            "0.081 m width, relaxed 0.035 m association, and "
-            f"{max_tilt_from_vertical_deg:.0f} degree vertical-approach limits"
+            "no detection-box-associated, collision-free, IK-reachable Panda grasp "
+            "satisfies the 0.085 m predicted-width and 60° vertical-approach limits"
         )
-    # A new point cloud is inferred on every retry. If it exposes fewer
-    # candidates than the requested rank, retry its last remaining candidate;
-    # otherwise advance to a genuinely different pose.
-    return ranked[min(candidate_index, len(ranked) - 1)][4]
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return ranked[min(candidate_index, len(ranked) - 1)][3]
+
+
+def _camera_points_world(
+    points_camera: object, world_from_camera: object
+) -> np.ndarray:
+    points = np.asarray(points_camera, dtype=np.float64)
+    transform = np.asarray(world_from_camera, dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1:] != (3,)
+        or len(points) == 0
+        or not np.isfinite(points).all()
+    ):
+        raise SemanticValidationError(
+            "RGB-D point cloud must be a finite nonempty (N, 3) array"
+        )
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise SemanticValidationError(
+            "world_from_camera must be a finite 4x4 matrix"
+        )
+    homogeneous = np.column_stack((points, np.ones(len(points))))
+    return (transform @ homogeneous.T).T[:, :3]
+
+
+def _free_destination_xy(
+    target_world: np.ndarray,
+    destination_world: np.ndarray,
+) -> np.ndarray:
+    """Choose a low, interior RGB-D slot instead of an occupied bin center."""
+
+    center = np.median(destination_world[:, :2], axis=0)
+    if len(destination_world) < 32:
+        return center
+    low = np.quantile(destination_world[:, :2], 0.05, axis=0)
+    high = np.quantile(destination_world[:, :2], 0.95, axis=0)
+    span = high - low
+    target_span = np.ptp(target_world[:, :2], axis=0)
+    wall_margin = target_span / 2.0 + 0.015
+    slot_low = low + wall_margin
+    slot_high = high - wall_margin
+    if np.any(slot_low >= slot_high):
+        return center
+    center = np.clip(center, slot_low, slot_high)
+    max_offset = np.minimum(center - slot_low, slot_high - center)
+    offset = np.minimum(span * 0.22, max_offset)
+    candidates = np.array(
+        [
+            center,
+            center + [-offset[0], 0.0],
+            center + [offset[0], 0.0],
+            center + [0.0, -offset[1]],
+            center + [0.0, offset[1]],
+            center + [-offset[0], -offset[1]],
+            center + [-offset[0], offset[1]],
+            center + [offset[0], -offset[1]],
+            center + [offset[0], offset[1]],
+        ],
+        dtype=np.float64,
+    )
+    local_radius = max(0.02, float(np.max(target_span)) / 2.0 + 0.005)
+    clear_surface_height = (
+        float(np.quantile(destination_world[:, 2], 0.05)) + 0.015
+    )
+    scores = []
+    for index, candidate in enumerate(candidates):
+        distances = np.linalg.norm(
+            destination_world[:, :2] - candidate, axis=1
+        )
+        local_heights = destination_world[distances <= local_radius, 2]
+        local_peak = (
+            float(np.quantile(local_heights, 0.90))
+            if len(local_heights) >= 8
+            else float("inf")
+        )
+        obstacle_excess = max(0.0, local_peak - clear_surface_height)
+        scores.append(
+            (
+                obstacle_excess > 0.0,
+                obstacle_excess,
+                float(np.linalg.norm(candidate - center)),
+                index,
+            )
+        )
+    return candidates[min(scores)[3]]
+
+
+def _placement_world_position(
+    target_points_camera: object,
+    destination_points_camera: object,
+    world_from_camera: object,
+    world_from_ee: object,
+    *,
+    clearance_m: float = 0.01,
+) -> np.ndarray:
+    """Compute an EE placement position from RGB-D geometry only.
+
+    The target-to-EE translation measured at grasp time is preserved while the
+    estimated target center is translated to a low, interior destination slot.
+    No simulator object pose, bin AABB, or desired orientation is used.
+    """
+    target_world = _camera_points_world(target_points_camera, world_from_camera)
+    destination_world = _camera_points_world(
+        destination_points_camera, world_from_camera
+    )
+    ee = np.asarray(world_from_ee, dtype=np.float64)
+    if ee.shape != (4, 4) or not np.isfinite(ee).all():
+        raise SemanticValidationError("world_from_ee must be a finite 4x4 matrix")
+    if not np.isfinite(clearance_m) or clearance_m < 0:
+        raise SemanticValidationError("clearance_m must be nonnegative and finite")
+
+    target_center = np.median(target_world, axis=0)
+    destination_center = np.median(destination_world, axis=0)
+    destination_center[:2] = _free_destination_xy(
+        target_world, destination_world
+    )
+    target_height = max(0.01, float(np.ptp(target_world[:, 2])))
+    destination_floor = float(np.quantile(destination_world[:, 2], 0.05))
+    destination_rim = float(np.quantile(destination_world[:, 2], 0.95))
+    target_half_height = target_height / 2.0
+    # The release pose is intentionally above the RGB-D-estimated rim. Driving
+    # the closed fingers toward the bin floor causes contact before the TCP can
+    # reach its target, which previously triggered a premature high release.
+    destination_center[2] = max(
+        destination_floor + target_half_height + clearance_m,
+        destination_rim + target_half_height + clearance_m,
+    )
+    ee_offset_from_target = ee[:3, 3] - target_center
+    return destination_center + ee_offset_from_target
 
 
 class PandaAgentRuntime:
@@ -699,12 +970,63 @@ class PandaAgentRuntime:
             return f"{failure}; recovery failed: {exc}", False
         return failure, True
 
-    def _return_home_after_failure(self, failure: str) -> str:
-        try:
-            self.skill.return_home()
-        except (AgenticManipulationError, KeyError, TypeError, ValueError) as exc:
-            return f"{failure}; home recovery failed: {exc}"
-        return failure
+    def _perceive_regions(
+        self,
+        frame: CameraFrame,
+        *,
+        artifact_prefix: str,
+        task_step: int | None,
+    ) -> _RegionPerception | None:
+        """Create one RGB-D-only inventory shared by reasoning and execution."""
+        regions = segment_depth(frame)
+        if not regions:
+            return None
+        inventory = self.vlm.classify_regions(
+            frame, tuple(region.bbox for region in regions)
+        )
+        if len(inventory) != len(regions):
+            raise SemanticValidationError(
+                "VLM region inventory count does not match depth segmentation"
+            )
+        geometry = _region_geometry(frame, regions)
+        labeled: list[tuple[BBox, str]] = []
+        inventory_rows: list[dict[str, object]] = []
+        for idx, (region, item, region_geometry) in enumerate(
+            zip(regions, inventory, geometry, strict=True)
+        ):
+            if item.region_id != idx:
+                raise SemanticValidationError(
+                    "VLM region inventory ids do not match depth region order"
+                )
+            labeled.append((region.bbox, f"R{idx} {item.label} ({item.color})"))
+            inventory_rows.append(
+                {
+                    **asdict(item),
+                    "bbox_xyxy_norm": asdict(region.bbox),
+                    "center_xy_norm": list(region.centroid_norm),
+                    "area_px": region.area_px,
+                    "point_count": region_geometry.point_count,
+                    "center_camera_m": list(region_geometry.center_camera_m),
+                    "center_world_m": list(region_geometry.center_world_m),
+                }
+            )
+            self._emit(
+                RuntimeEventType.ACTION,
+                f"depth region {idx}: color={item.color}, kind={item.kind}, "
+                f"label={item.label}, location={item.image_location}, "
+                f"center_xy_norm={np.round(region.centroid_norm, 4).tolist()}, "
+                f"center_world_m="
+                f"{np.round(region_geometry.center_world_m, 4).tolist()}",
+                task_step,
+            )
+        self.artifacts.write_json(
+            f"{artifact_prefix}_region_inventory", {"regions": inventory_rows}
+        )
+        annotated_rgb = _draw_depth_regions(frame.rgb, labeled)
+        self._present_image(
+            "perception", f"{artifact_prefix}_depth_regions", annotated_rgb
+        )
+        return _RegionPerception(frame, regions, inventory, geometry, annotated_rgb)
 
     def _attempt(
         self,
@@ -712,26 +1034,63 @@ class PandaAgentRuntime:
         task: object,
         used_targets: set[str],
         attempt: int,
-    ) -> tuple[ResolvedAction, GroundedAction, np.ndarray]:
+        perception: _RegionPerception | None = None,
+    ) -> tuple[ResolvedAction, GroundedAction, AtomicTransferPlan]:
         self._emit(RuntimeEventType.ACTION, f"grounding attempt {attempt}", task.step)
-        frame = self.scene.capture()
-        segmentation_ids = self.scene.segmentation_ids()
+        frame = perception.frame if perception is not None else self.scene.capture()
         artifact_prefix = f"step_{task.step}_attempt_{attempt}"
-        annotated = annotated_grounding_frame(frame, segmentation_ids)
         self.artifacts.write_frame(frame, name=f"{artifact_prefix}_grounding_raw")
-        self.artifacts.write_frame(
-            annotated, name=f"{artifact_prefix}_grounding_annotated"
-        )
-        catalog = grounding_bbox_catalog(frame, segmentation_ids)
-        grounding_task = replace(
-            task,
-            action=f"{task.action}\n{catalog}",
-        )
-        grounded = self.vlm.ground(
-            command,
-            grounding_task,
-            annotated,
-        )
+        target_region = None
+        destination_region = None
+
+        # ── 1. Depth-based object segmentation ──────────────────────────
+        if perception is None:
+            perception = self._perceive_regions(
+                frame, artifact_prefix=artifact_prefix, task_step=task.step
+            )
+        if perception is None:
+            # Fall back to VLM full-scene grounding when depth segmentation
+            # finds nothing (e.g. objects too close together).
+            grounded = self.vlm.ground(command, task, frame)
+        else:
+            # ── 2. VLM full-scene region inventory ──────────────────────
+            regions = perception.regions
+            inventory = perception.inventory
+
+            # ── 4. Match target / destination by label ──────────────────
+            target_label, dest_label = _task_labels(task)
+            target_matches = [
+                region
+                for region, item in zip(regions, inventory, strict=True)
+                if item.label == target_label
+            ]
+            destination_matches = [
+                region
+                for region, item in zip(regions, inventory, strict=True)
+                if item.label == dest_label
+            ]
+            if len(target_matches) != 1:
+                raise SemanticValidationError(
+                    f"depth segmentation must find one target {target_label}; "
+                    f"classified: {[item.label for item in inventory]}"
+                )
+            if len(destination_matches) != 1:
+                raise SemanticValidationError(
+                    f"depth segmentation must find one destination {dest_label}; "
+                    f"classified: {[item.label for item in inventory]}"
+                )
+            target_region = target_matches[0]
+            destination_region = destination_matches[0]
+
+            grounded = GroundedAction(
+                type="action",
+                task_step=task.step,
+                target_label=target_label,
+                target_bbox=target_region.bbox,
+                destination_label=dest_label,
+                destination_bbox=destination_region.bbox,
+            )
+
         self.artifacts.write_json(
             f"{artifact_prefix}_action", asdict(grounded)
         )
@@ -739,9 +1098,7 @@ class PandaAgentRuntime:
             raise SemanticValidationError(
                 f"action step {grounded.task_step} does not match task {task.step}"
             )
-        resolved = resolve_panda_action(
-            grounded, frame, segmentation_ids, used_targets
-        )
+        resolved = resolve_panda_action(grounded, used_targets)
         self._present_image(
             "grounding",
             f"{artifact_prefix}_grounding_selection",
@@ -752,16 +1109,25 @@ class PandaAgentRuntime:
             f"{artifact_prefix}_depth_gray",
             depth_grayscale_rgb(frame.depth_m),
         )
-        instance_to_seg = {
-            instance_id: segmentation_id
-            for segmentation_id, instance_id in segmentation_ids.items()
-        }
-        segmentation_id = instance_to_seg[resolved.target_instance_id]
+        # Extract point cloud using the VLM-confirmed bounding box.
         target_points = backproject_camera(
-            frame, resolved.target_bbox, segmentation_id
+            frame,
+            resolved.target_bbox,
+            pixel_mask=None if target_region is None else target_region.mask,
+        )
+        destination_points = backproject_camera(
+            frame,
+            resolved.destination_bbox,
+            pixel_mask=(
+                None if destination_region is None else destination_region.mask
+            ),
         )
         full_workspace_points = backproject_camera(frame)
-        if len(target_points) == 0 or len(full_workspace_points) == 0:
+        if (
+            len(target_points) == 0
+            or len(destination_points) == 0
+            or len(full_workspace_points) == 0
+        ):
             raise SemanticValidationError("grounded point cloud is empty")
         workspace_points = crop_local_workspace_camera(
             full_workspace_points,
@@ -773,6 +1139,9 @@ class PandaAgentRuntime:
         )
         self.artifacts.write_array(
             f"{artifact_prefix}_workspace_points_camera", workspace_points
+        )
+        self.artifacts.write_array(
+            f"{artifact_prefix}_destination_points_camera", destination_points
         )
         self._emit(
             RuntimeEventType.GRASPING,
@@ -787,7 +1156,10 @@ class PandaAgentRuntime:
             candidates,
             target_points,
             frame.world_from_camera,
-            target_instance_id=resolved.target_instance_id,
+            target_bbox=resolved.target_bbox,
+            intrinsic=frame.intrinsic,
+            image_hw=frame.rgb.shape[:2],
+            reachable=self.skill.can_pick,
             candidate_index=attempt - 1,
         )
         self._present_image(
@@ -812,6 +1184,18 @@ class PandaAgentRuntime:
         world_from_ee = compose_panda_world_ee(
             frame.world_from_camera, selected.world_from_gripper
         )
+        placement_position = _placement_world_position(
+            target_points,
+            destination_points,
+            frame.world_from_camera,
+            world_from_ee,
+        )
+        nominal_world_from_release = np.eye(4, dtype=np.float64)
+        nominal_world_from_release[:3, :3] = world_from_ee[:3, :3]
+        nominal_world_from_release[:3, 3] = placement_position
+        transfer_plan = self.skill.plan_transfer(
+            world_from_ee, nominal_world_from_release
+        )
         self._emit(
             RuntimeEventType.GRASPING,
             "selected grasp camera position "
@@ -826,13 +1210,17 @@ class PandaAgentRuntime:
                 "destination": resolved.destination_instance_id,
                 "target_point_count": len(target_points),
                 "workspace_point_count": len(workspace_points),
+                "destination_point_count": len(destination_points),
                 "camera_from_grasp": selected.world_from_gripper.tolist(),
                 "world_from_ee": world_from_ee.tolist(),
+                "nominal_world_from_release": nominal_world_from_release.tolist(),
+                "planned_world_from_release": transfer_plan.release.tolist(),
+                "placement_world_position": transfer_plan.release[:3, 3].tolist(),
                 "score": selected.score,
                 "width_m": selected.width_m,
             },
         )
-        return resolved, grounded, world_from_ee
+        return resolved, grounded, transfer_plan
 
     def run(self, command: str) -> RuntimeResult:
         if not isinstance(command, str) or not command.strip():
@@ -843,15 +1231,34 @@ class PandaAgentRuntime:
             self._emit(RuntimeEventType.OBSERVING, "capturing doable frame")
             initial = self.scene.capture()
             self.artifacts.write_frame(initial, name="initial")
-            doable = self.vlm.evaluate_doable(command, initial)
+            initial_perception = self._perceive_regions(
+                initial, artifact_prefix="initial", task_step=None
+            )
+            initial_vlm_frame = (
+                initial
+                if initial_perception is None
+                else initial_perception.vlm_frame()
+            )
+            initial_command = (
+                command
+                if initial_perception is None
+                else initial_perception.command_context(command)
+            )
+            doable = self.vlm.evaluate_doable(initial_command, initial_vlm_frame)
             self._emit(RuntimeEventType.DOABLE, doable.thought)
             if not doable.status:
                 return self._result(False, results, f"task is not doable: {doable.thought}")
-            plan = self.vlm.plan(command, self.scene.capture())
-            plan = canonicalize_panda_plan(
-                command, plan, self.scene.visible_instances()
+            plan = self.vlm.plan(initial_command, initial_vlm_frame)
+            perceived_catalog = (
+                _SCENE_INSTANCE_CATALOG
+                if initial_perception is None
+                else {
+                    item.label: item.label
+                    for item in initial_perception.inventory
+                }
             )
-            validate_panda_plan(plan, self.scene.visible_instances())
+            plan = canonicalize_panda_plan(command, plan, perceived_catalog)
+            validate_panda_plan(plan, perceived_catalog)
             self.artifacts.write_json("plan", asdict(plan))
             self._emit(RuntimeEventType.PLANNING, f"planned {len(plan.tasks)} tasks")
         except (AgenticManipulationError, KeyError, TypeError, ValueError) as exc:
@@ -864,8 +1271,28 @@ class PandaAgentRuntime:
                 {"task_step": task.step, "context": subtask_context},
             )
             try:
+                if task.step == 1 and initial_perception is not None:
+                    task_perception = initial_perception
+                    task_frame = initial_vlm_frame
+                else:
+                    raw_task_frame = self.scene.capture()
+                    task_perception = self._perceive_regions(
+                        raw_task_frame,
+                        artifact_prefix=f"step_{task.step}_initial",
+                        task_step=task.step,
+                    )
+                    task_frame = (
+                        raw_task_frame
+                        if task_perception is None
+                        else task_perception.vlm_frame()
+                    )
+                task_command = (
+                    subtask_context
+                    if task_perception is None
+                    else task_perception.command_context(subtask_context)
+                )
                 task_scene = self.vlm.evaluate_doable(
-                    subtask_context, self.scene.capture()
+                    task_command, task_frame
                 )
             except (AgenticManipulationError, KeyError, TypeError, ValueError) as exc:
                 failure = f"task scene description failed: {exc}"
@@ -883,58 +1310,80 @@ class PandaAgentRuntime:
             last_failure = "unknown grasp failure"
             completed = False
             for attempt in range(1, self.config.max_retries + 2):
-                pick_started = False
+                transfer_started = False
                 try:
-                    resolved, grounded, world_from_ee = self._attempt(
-                        subtask_context, task, used_targets, attempt
+                    (
+                        resolved,
+                        grounded,
+                        transfer_plan,
+                    ) = self._attempt(
+                        task_command,
+                        task,
+                        used_targets,
+                        attempt,
+                        perception=task_perception if attempt == 1 else None,
                     )
-                    self._emit(RuntimeEventType.EXECUTING, "atomic pick", task.step)
-                    pick_started = True
-                    pick = self.skill.pick(
-                        resolved.target_instance_id, world_from_ee
-                    )
-                    if not pick.success:
-                        last_failure = pick.failure_reason or "atomic pick failed"
-                        last_failure, recovered = self._recover_pick_failure(
-                            last_failure
+                    grasp_visual = None
+
+                    def confirm_grasp() -> bool:
+                        nonlocal grasp_visual
+                        grasp_frame = self.scene.capture()
+                        self.artifacts.write_frame(
+                            grasp_frame,
+                            name=(
+                                f"step_{task.step}_attempt_{attempt}_grasp_check"
+                            ),
                         )
-                        if not recovered:
-                            break
-                        if attempt <= self.config.max_retries:
-                            self._emit(RuntimeEventType.RETRYING, last_failure, task.step)
-                            continue
-                        break
+                        grasp_visual = self.vlm.check_grasp(
+                            subtask_context, task, grounded, grasp_frame
+                        )
+                        self._emit(
+                            RuntimeEventType.CHECKING,
+                            "near-field RGB-D grasp checker",
+                            task.step,
+                        )
+                        return grasp_visual.status
+
                     self._emit(
                         RuntimeEventType.EXECUTING,
-                        f"atomic place into {resolved.destination_instance_id}",
+                        "atomic pick-check-transfer-release into "
+                        f"{resolved.destination_instance_id}",
                         task.step,
                     )
-                    try:
-                        place = self.skill.place(
-                            resolved.target_instance_id,
-                            resolved.destination_instance_id,
+                    transfer_started = True
+                    transfer = self.skill.execute(
+                        resolved.target_instance_id,
+                        transfer_plan,
+                        confirm_grasp,
+                    )
+                    if "home_return" not in transfer.stages:
+                        reset_failure, recovered = self._recover_pick_failure(
+                            "atomic transfer did not confirm observation-home reset"
                         )
-                    except (
-                        AgenticManipulationError,
-                        KeyError,
-                        TypeError,
-                        ValueError,
-                    ) as exc:
-                        failure = self._return_home_after_failure(str(exc))
-                        results.append(
-                            TaskResult(task.step, False, (failure,), attempt)
+                        if not recovered:
+                            last_failure = reset_failure
+                            break
+                    self._emit(
+                        RuntimeEventType.EXECUTING,
+                        "observation-home reset confirmed; capturing fresh RGB-D",
+                        task.step,
+                    )
+                    if not transfer.success:
+                        last_failure = (
+                            f"visual grasp false: {grasp_visual.thought}"
+                            if grasp_visual is not None
+                            and not grasp_visual.status
+                            else transfer.failure_reason
+                            or "atomic transfer failed"
                         )
-                        return self._result(
-                            False,
-                            results,
-                            f"step {task.step} failed during place: {failure}",
-                        )
-                    if not place.success:
-                        failure = self._return_home_after_failure(
-                            place.failure_reason or "atomic place failed"
-                        )
-                        results.append(TaskResult(task.step, False, (failure,), attempt))
-                        return self._result(False, results, f"step {task.step} failed: {failure}")
+                        if attempt <= self.config.max_retries:
+                            self._emit(
+                                RuntimeEventType.RETRYING,
+                                last_failure,
+                                task.step,
+                            )
+                            continue
+                        break
                     place_frame = self.scene.capture()
                     self.artifacts.write_frame(
                         place_frame,
@@ -943,30 +1392,63 @@ class PandaAgentRuntime:
                     place_visual = self.vlm.check_place(
                         subtask_context, task, grounded, place_frame
                     )
-                    self._emit(RuntimeEventType.CHECKING, "place checker", task.step)
+                    rgb_place = _rgb_target_inside_destination(
+                        place_frame.rgb,
+                        resolved.target_instance_id,
+                        resolved.destination_bbox,
+                    )
+                    self.artifacts.write_json(
+                        f"step_{task.step}_attempt_{attempt}_place_rgb_evidence",
+                        {
+                            **asdict(rgb_place),
+                            "vlm_status": place_visual.status,
+                            "vlm_thought": place_visual.thought,
+                        },
+                    )
+                    self._emit(
+                        RuntimeEventType.CHECKING,
+                        "place checker: "
+                        f"vlm={place_visual.status}, rgb={rgb_place.status}, "
+                        f"inside={rgb_place.inside_pixel_count}/"
+                        f"{rgb_place.target_pixel_count}",
+                        task.step,
+                    )
                     failures = []
-                    if not place_visual.status:
+                    if rgb_place.status is False:
+                        failures.append(
+                            "RGB target-color evidence is outside destination: "
+                            f"{rgb_place.inside_pixel_count}/"
+                            f"{rgb_place.target_pixel_count} pixels"
+                        )
+                    elif rgb_place.status is None and not place_visual.status:
                         failures.append(f"visual place false: {place_visual.thought}")
-                    if not self.scene.is_in_bin(
-                        resolved.target_instance_id, resolved.destination_instance_id
-                    ):
-                        failures.append("target is not inside destination bin")
-                    if not self.scene.is_released(resolved.target_instance_id):
-                        failures.append("target is still held")
                     if failures:
+                        last_failure = "; ".join(failures)
+                        if attempt <= self.config.max_retries:
+                            self._emit(
+                                RuntimeEventType.RETRYING,
+                                last_failure,
+                                task.step,
+                            )
+                            continue
                         results.append(
                             TaskResult(task.step, False, tuple(failures), attempt)
                         )
                         return self._result(
                             False,
                             results,
-                            f"step {task.step} place check failed: {'; '.join(failures)}",
+                            f"step {task.step} place check failed: {last_failure}",
                         )
                     results.append(TaskResult(task.step, True, (), attempt))
                     used_targets.add(resolved.target_instance_id)
+                    completion_evidence = (
+                        place_visual.thought
+                        if place_visual.status
+                        else "RGB target-color evidence confirms placement"
+                    )
                     self._emit(
                         RuntimeEventType.TASK_COMPLETED,
-                        f"{place_visual.thought}; {resolved.target_instance_id} "
+                        f"{completion_evidence}; {resolved.target_instance_id} "
                         f"is released inside {resolved.destination_instance_id}",
                         task.step,
                     )
@@ -974,13 +1456,18 @@ class PandaAgentRuntime:
                     break
                 except (AgenticManipulationError, KeyError, TypeError, ValueError) as exc:
                     last_failure = str(exc)
-                    if pick_started:
+                    safe_to_retry = not transfer_started
+                    if transfer_started:
+                        safe_to_retry = (
+                            isinstance(exc, MotionStageError)
+                            and exc.stage in {"pregrasp", "approach", "lift"}
+                        )
                         last_failure, recovered = self._recover_pick_failure(
                             last_failure
                         )
                         if not recovered:
                             break
-                    if attempt <= self.config.max_retries:
+                    if safe_to_retry and attempt <= self.config.max_retries:
                         self._emit(RuntimeEventType.RETRYING, last_failure, task.step)
                         continue
                     break
@@ -990,7 +1477,7 @@ class PandaAgentRuntime:
                         task.step,
                         False,
                         (last_failure,),
-                        self.config.max_retries + 1,
+                        attempt,
                     )
                 )
                 return self._result(

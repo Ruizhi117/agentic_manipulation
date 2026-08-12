@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -382,6 +380,10 @@ class _MockPickBackend:
         del steps
         self._record(stage, np.asarray(target_pose, dtype=np.float64))
 
+    def can_reach(self, target_pose) -> bool:
+        value = np.asarray(target_pose, dtype=np.float64)
+        return value.shape == (4, 4) and bool(np.isfinite(value).all())
+
     def set_gripper(self, value, steps, stage) -> None:
         del steps
         self.gripper = float(value)
@@ -402,6 +404,61 @@ class _MockPickBackend:
     def settle(self, steps) -> None:
         del steps
         self._record("settle", self.home_pose)
+
+
+def _fixture_place_position(
+    backend: object, target: str, destination: str
+) -> np.ndarray:
+    """Return a deterministic 3D position for the standalone stage fixture."""
+    low, high = backend.bin_inner_aabb(destination)
+    low = np.asarray(low, dtype=np.float64)
+    high = np.asarray(high, dtype=np.float64)
+    result = (low + high) / 2.0
+    result[2] = low[2] + float(backend.object_half_height(target)) + 0.01
+    return result
+
+
+def _evaluation_bool(value: object) -> bool:
+    if hasattr(value, "detach"):
+        return bool(value.reshape(-1)[0].detach().cpu().item())
+    return bool(np.asarray(value).reshape(-1)[0])
+
+
+def _evaluation_is_grasping(base_env: object, target: str) -> bool:
+    actor = base_env.semantic_actors[target]
+    return _evaluation_bool(base_env.agent.is_grasping(actor))
+
+
+def _evaluation_place_position(
+    base_env: object, target: str, destination: str
+) -> np.ndarray:
+    low, high = base_env.bin_inner_aabbs[destination]
+    low = np.asarray(low, dtype=np.float64)
+    high = np.asarray(high, dtype=np.float64)
+    result = (low + high) / 2.0
+    result[2] = low[2] + float(base_env.object_half_heights[target]) + 0.01
+    return result
+
+
+def _evaluation_place_truth(
+    base_env: object, target: str, destination: str
+) -> tuple[bool, bool, bool]:
+    actor = base_env.semantic_actors[target]
+    center = actor.pose.p[0]
+    if hasattr(center, "detach"):
+        center = center.detach().cpu().numpy()
+    center = np.asarray(center, dtype=np.float64)
+    low, high = base_env.bin_inner_aabbs[destination]
+    low = np.asarray(low, dtype=np.float64)
+    high = np.asarray(high, dtype=np.float64)
+    inside = bool(
+        np.all(center[:2] >= low[:2])
+        and np.all(center[:2] <= high[:2])
+        and center[2] >= low[2]
+    )
+    released = not _evaluation_bool(base_env.agent.is_grasping(actor))
+    stable = _evaluation_bool(actor.is_static())
+    return inside, released, stable
 
 
 def _run_mock_pick(
@@ -483,7 +540,7 @@ def _run_real_pick(
         report = PandaAtomicPickPlaceSkill(
             backend, motion_steps=motion_steps, gripper_steps=20
         ).pick(target, world_from_ee)
-        simulator_grasped = backend.is_grasping(target)
+        simulator_grasped = _evaluation_is_grasping(base, target)
         video = directory / "pick.mp4"
         motion = directory / "motion.json"
         recorder.write_mp4(video)
@@ -528,7 +585,13 @@ def _run_mock_place(
     backend = _MockPickBackend(recorder, observation)
     skill = PandaAtomicPickPlaceSkill(backend)
     pick = skill.pick(target, grasp["world_from_ee"])
-    place = skill.place(target, destination) if pick.success else None
+    place = (
+        skill.place(
+            target, _fixture_place_position(backend, target, destination)
+        )
+        if pick.success
+        else None
+    )
     success = bool(pick.success and place is not None and place.success)
     directory = output / "place"
     directory.mkdir(parents=True, exist_ok=True)
@@ -565,8 +628,6 @@ def _run_real_place(
     render_backend: str,
     motion_steps: int,
 ) -> dict[str, object]:
-    from agentic_manipulation.envs.panda_runtime_scene import PandaSortingScene
-
     env = _make_real_env(render_backend)
     directory = output / "place"
     directory.mkdir(parents=True, exist_ok=True)
@@ -574,7 +635,6 @@ def _run_real_place(
     try:
         observation, _ = env.reset(seed=0, options={"reconfigure": True})
         base = env.unwrapped
-        scene = PandaSortingScene(env)
         frame = CameraAdapter().capture(
             observation, observation["sensor_param"], "hand_camera", timestamp=0.0
         )
@@ -616,10 +676,12 @@ def _run_real_place(
             skill.recover_after_failed_pick()
             place = None
         else:
-            place = skill.place(target, destination)
-        inside = scene.is_in_bin(target, destination)
-        released = scene.is_released(target)
-        stable = scene.is_stable(target)
+            place = skill.place(
+                target, _evaluation_place_position(base, target, destination)
+            )
+        inside, released, stable = _evaluation_place_truth(
+            base, target, destination
+        )
         success = bool(
             pick.success
             and place is not None

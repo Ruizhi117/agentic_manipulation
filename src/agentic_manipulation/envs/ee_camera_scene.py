@@ -1,4 +1,4 @@
-"""Panda wrist-camera sorting scene with six objects and two open bins."""
+"""Panda wrist-camera sorting scene with four blocks and two open bins."""
 
 from __future__ import annotations
 
@@ -22,8 +22,6 @@ GRASPABLE_INSTANCE_IDS = (
     "blue_cube",
     "yellow_block",
     "purple_block",
-    "green_cylinder",
-    "orange_cylinder",
 )
 DESTINATION_INSTANCE_IDS = ("white_bin", "pink_bin")
 SEMANTIC_LABELS = {
@@ -82,18 +80,6 @@ _OBJECT_CONFIGS: dict[str, tuple[str, np.ndarray, np.ndarray, list[float]]] = {
         np.array([0.025, 0.032, 0.020]),
         [0.55, 0.20, 0.75, 1.0],
     ),
-    # "green_cylinder": (
-    #     "cylinder",
-    #     np.array([0.045, 0.105, 0.030]),
-    #     np.array([0.024, 0.024, 0.030]),
-    #     [0.12, 0.70, 0.28, 1.0],
-    # ),
-    # "orange_cylinder": (
-    #     "cylinder",
-    #     np.array([0.135, -0.105, 0.027]),
-    #     np.array([0.021, 0.021, 0.027]),
-    #     [0.95, 0.38, 0.08, 1.0],
-    # ),
 }
 
 
@@ -117,7 +103,6 @@ class EECameraSceneEnv(BaseEnv):
     ) -> None:
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.semantic_actors: dict[str, Any] = {}
-        self.instance_segmentation_ids: dict[int, str] = {}
         self.bin_inner_aabbs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.object_half_heights = {
             name: float(config[2][2]) for name, config in _OBJECT_CONFIGS.items()
@@ -245,11 +230,6 @@ class EECameraSceneEnv(BaseEnv):
             high = center + half - inset
             low[2] = center[2] + 2 * _BIN_FLOOR_HALF_HEIGHT
             self.bin_inner_aabbs[name] = (low, high)
-        self.instance_segmentation_ids = {
-            int(actor.per_scene_id[0].item()): name
-            for name, actor in self.semantic_actors.items()
-        }
-
     def _initialize_episode(
         self, env_idx: torch.Tensor, options: dict[str, Any]
     ) -> None:
@@ -285,13 +265,8 @@ class EECameraSceneEnv(BaseEnv):
         }
 
     def _get_obs_extra(self, info: dict[str, torch.Tensor]) -> dict[str, Any]:
-        return {
-            "tcp_pose": self.agent.tcp_pose.raw_pose,
-            **{
-                f"{name}_pose": actor.pose.raw_pose
-                for name, actor in self.semantic_actors.items()
-            },
-        }
+        del info
+        return {"tcp_pose": self.agent.tcp_pose.raw_pose}
 
     def compute_dense_reward(
         self, obs: Any, action: torch.Tensor, info: dict[str, torch.Tensor]

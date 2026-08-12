@@ -31,3 +31,11 @@ class PerceptionError(AgenticManipulationError):
 
 class ExecutionError(AgenticManipulationError):
     """Raised when a robot motion cannot be executed safely."""
+
+
+class MotionStageError(ExecutionError):
+    """Execution failure tagged with the motion stage that produced it."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage

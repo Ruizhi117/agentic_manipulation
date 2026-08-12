@@ -17,13 +17,17 @@ import numpy as np
 
 from agentic_manipulation.config import RuntimeConfig
 from agentic_manipulation.control.panda_atomic import (
-    AtomicPickReport,
-    AtomicPlaceReport,
+    AtomicTransferPlan,
+    AtomicTransferReport,
     PandaAtomicPickPlaceSkill,
     PandaDeltaPoseBackend,
 )
 from agentic_manipulation.demo.protocol import atomic_write_json, resolve_project_path
 from agentic_manipulation.demo.stage_recorder import StageRecorder
+from agentic_manipulation.envs.ee_camera_scene import (
+    DESTINATION_INSTANCE_IDS,
+    GRASPABLE_INSTANCE_IDS,
+)
 from agentic_manipulation.envs.panda_runtime_scene import PandaSortingScene
 from agentic_manipulation.errors import ConfigurationError
 from agentic_manipulation.models.graspnet import (
@@ -90,17 +94,39 @@ def validate_options(options: AgentDemoOptions, project_root: str | Path) -> Pat
 
 
 def _ollama_models(url: str) -> set[str]:
-    try:
-        with request.urlopen(f"{url.rstrip('/')}/api/tags", timeout=5) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, TimeoutError, ValueError) as exc:
-        raise ConfigurationError(
-            "Ollama is unavailable. Launch it with:\n" + ollama_launch_instructions()
-        ) from exc
-    try:
-        return {str(model["name"]) for model in payload["models"]}
-    except (KeyError, TypeError) as exc:
-        raise ConfigurationError("Ollama /api/tags returned an invalid response") from exc
+    """Return the set of model names available from the Ollama /api/tags endpoint.
+
+    Retries transient connection failures up to 3 times with short back-off,
+    and explicitly bypasses system proxy settings so that ``127.0.0.1`` is
+    always reached directly.
+    """
+    import time
+
+    target = f"{url.rstrip('/')}/api/tags"
+    # Bypass any system-wide proxy — Ollama listens on localhost.
+    proxy_handler = request.ProxyHandler({})
+    opener = request.build_opener(proxy_handler)
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            with opener.open(target, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, TimeoutError, ValueError) as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+            continue
+        try:
+            return {str(model["name"]) for model in payload["models"]}
+        except (KeyError, TypeError) as exc:
+            raise ConfigurationError(
+                "Ollama /api/tags returned an invalid response"
+            ) from exc
+    raise ConfigurationError(
+        f"Ollama is unreachable at {target} after 3 attempts. "
+        f"Last error: {last_exc}. "
+        "Make sure Ollama is running:\n" + ollama_launch_instructions()
+    ) from last_exc
 
 
 def check_real_prerequisites(
@@ -163,8 +189,6 @@ class _MockScene:
             "blue_cube",
             "yellow_block",
             "purple_block",
-            "green_cylinder",
-            "orange_cylinder",
             "white_bin",
             "pink_bin",
         )
@@ -201,13 +225,32 @@ class _MockVLM:
 
     def ground(self, command, task, frame):
         del command, frame
+        target = next(
+            label for label in GRASPABLE_INSTANCE_IDS if label in task.action
+        )
+        destination = next(
+            label for label in DESTINATION_INSTANCE_IDS if label in task.action
+        )
+        columns = {
+            "red_cube": 0,
+            "blue_cube": 1,
+            "yellow_block": 2,
+            "purple_block": 3,
+            "white_bin": 6,
+            "pink_bin": 7,
+        }
         return GroundedAction(
             "action",
             task.step,
-            "blue_cube",
-            BBox(1 / 8, 0.0, 2 / 8, 1.0),
-            "white_bin",
-            BBox(6 / 8, 0.0, 7 / 8, 1.0),
+            target,
+            BBox(columns[target] / 8, 0.0, (columns[target] + 1) / 8, 1.0),
+            destination,
+            BBox(
+                columns[destination] / 8,
+                0.0,
+                (columns[destination] + 1) / 8,
+                1.0,
+            ),
         )
 
     def check_grasp(self, command, task, grounded, frame):
@@ -222,25 +265,55 @@ class _MockVLM:
 class _MockSkill:
     def __init__(self, scene: _MockScene) -> None:
         self.scene = scene
+        self.backend = self
 
-    def pick(self, instance_id, world_from_ee):
-        del world_from_ee
+    def can_pick(self, _pose: object) -> bool:
+        return True
+
+    def plan_transfer(self, world_from_ee, world_from_release):
+        grasp = np.asarray(world_from_ee, dtype=np.float64)
+        release = np.asarray(world_from_release, dtype=np.float64)
+        return AtomicTransferPlan(
+            grasp, grasp, grasp, release, release, grasp
+        )
+
+    def execute(self, instance_id, plan, confirm_grasp):
+        del plan
         self.scene.held = instance_id
-        return AtomicPickReport(
+        if not confirm_grasp():
+            self.scene.held = None
+            return AtomicTransferReport(
+                False,
+                (
+                    "close",
+                    "lift",
+                    "grasp_check",
+                    "open_recover",
+                    "home_return",
+                    "settle",
+                ),
+                "not held",
+            )
+        self.scene.held = None
+        return AtomicTransferReport(
             True,
-            ("home_observe", "open", "pregrasp", "approach", "close", "lift"),
+            (
+                "pregrasp",
+                "approach",
+                "close",
+                "lift",
+                "grasp_check",
+                "preplace",
+                "place",
+                "open_release",
+                "retreat",
+                "home_return",
+                "settle",
+            ),
         )
 
     def recover_after_failed_pick(self):
         self.scene.held = None
-
-    def place(self, instance_id, bin_id):
-        self.scene.held = None
-        self.scene.location[instance_id] = bin_id
-        return AtomicPlaceReport(
-            True,
-            ("preplace", "place", "open_release", "retreat", "home_return", "settle"),
-        )
 
     def return_home(self):
         return None
@@ -296,7 +369,7 @@ def _run_real(
         "EECameraScene-v1",
         robot_uids="panda_wristcam",
         control_mode="pd_ee_delta_pose",
-        obs_mode="rgb+depth+segmentation",
+        obs_mode="rgb+depth",
         render_backend=options.render_backend,
         num_envs=1,
         sensor_configs={

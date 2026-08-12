@@ -14,6 +14,7 @@ def _selected_camera_data(
     frame: CameraFrame,
     bbox: BBox | None,
     segmentation_id: int | None,
+    pixel_mask: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Select calibrated camera points and their RGB values in pixel order."""
 
@@ -24,12 +25,20 @@ def _selected_camera_data(
         x1, y1, x2, y2 = bbox.as_pixels(width, height)
     if segmentation_id is not None and frame.segmentation is None:
         raise PerceptionError("segmentation is required when segmentation_id is set")
+    if pixel_mask is not None:
+        pixel_mask = np.asarray(pixel_mask, dtype=bool)
+        if pixel_mask.shape != (height, width):
+            raise PerceptionError(
+                "pixel_mask shape must match the RGB-D frame height and width"
+            )
 
     depth = frame.depth_m[y1:y2, x1:x2]
     vv, uu = np.mgrid[y1:y2, x1:x2]
     valid = np.isfinite(depth) & (depth > 0)
     if segmentation_id is not None:
         valid &= frame.segmentation[y1:y2, x1:x2] == segmentation_id
+    if pixel_mask is not None:
+        valid &= pixel_mask[y1:y2, x1:x2]
     if not np.any(valid):
         return (
             np.empty((0, 3), dtype=np.float32),
@@ -52,10 +61,12 @@ def backproject_camera(
     frame: CameraFrame,
     bbox: BBox | None = None,
     segmentation_id: int | None = None,
+    *,
+    pixel_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Back-project valid pixels into the OpenCV camera coordinate frame."""
 
-    points, _ = _selected_camera_data(frame, bbox, segmentation_id)
+    points, _ = _selected_camera_data(frame, bbox, segmentation_id, pixel_mask)
     return points
 
 
@@ -63,10 +74,12 @@ def point_colors(
     frame: CameraFrame,
     bbox: BBox | None = None,
     segmentation_id: int | None = None,
+    *,
+    pixel_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return RGB colors aligned with :func:`backproject_camera` points."""
 
-    _, colors = _selected_camera_data(frame, bbox, segmentation_id)
+    _, colors = _selected_camera_data(frame, bbox, segmentation_id, pixel_mask)
     return colors
 
 
@@ -74,10 +87,14 @@ def backproject(
     frame: CameraFrame,
     bbox: BBox | None = None,
     segmentation_id: int | None = None,
+    *,
+    pixel_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Back-project valid pixels into world coordinates."""
 
-    camera_points = backproject_camera(frame, bbox, segmentation_id)
+    camera_points = backproject_camera(
+        frame, bbox, segmentation_id, pixel_mask=pixel_mask
+    )
     if len(camera_points) == 0:
         return np.empty((0, 3), dtype=np.float32)
     homogeneous = np.column_stack((camera_points, np.ones(len(camera_points))))

@@ -142,6 +142,49 @@ class GroundedAction:
 
 
 @dataclass(frozen=True)
+class RegionClassification:
+    """VLM color/category judgment for one depth-segmented image region."""
+
+    region_id: int
+    color: str
+    kind: str
+    image_location: str
+    label: str
+    vlm_color: str | None = None
+    vlm_kind: str | None = None
+    color_source: str = "vlm"
+    rgb_median: tuple[float, float, float] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.region_id, bool)
+            or not isinstance(self.region_id, int)
+            or self.region_id < 0
+        ):
+            raise ValueError("region_id must be a nonnegative integer")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (self.color, self.kind, self.image_location, self.label)
+        ):
+            raise ValueError("region classification strings must not be blank")
+        if self.vlm_color is not None and (
+            not isinstance(self.vlm_color, str) or not self.vlm_color.strip()
+        ):
+            raise ValueError("vlm_color must be nonblank when provided")
+        if self.vlm_kind is not None and (
+            not isinstance(self.vlm_kind, str) or not self.vlm_kind.strip()
+        ):
+            raise ValueError("vlm_kind must be nonblank when provided")
+        if not isinstance(self.color_source, str) or not self.color_source.strip():
+            raise ValueError("color_source must not be blank")
+        if self.rgb_median is not None and (
+            len(self.rgb_median) != 3
+            or not all(math.isfinite(value) for value in self.rgb_median)
+        ):
+            raise ValueError("rgb_median must contain three finite values")
+
+
+@dataclass(frozen=True)
 class CheckerEval:
     type: str
     thought: str

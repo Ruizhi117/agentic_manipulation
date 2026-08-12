@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from agentic_manipulation.errors import ExecutionError
+from agentic_manipulation.errors import ExecutionError, MotionStageError
 
 
 class PandaMotionBackend(Protocol):
@@ -16,15 +16,11 @@ class PandaMotionBackend(Protocol):
 
     home_pose: np.ndarray
 
+    def can_reach(self, target_pose: np.ndarray) -> bool: ...
+
     def move_ee(self, target_pose: np.ndarray, steps: int, stage: str) -> None: ...
 
     def set_gripper(self, value: float, steps: int, stage: str) -> None: ...
-
-    def is_grasping(self, instance_id: str) -> bool: ...
-
-    def bin_inner_aabb(self, bin_id: str) -> tuple[np.ndarray, np.ndarray]: ...
-
-    def object_half_height(self, instance_id: str) -> float: ...
 
     def settle(self, steps: int) -> None: ...
 
@@ -38,6 +34,49 @@ class AtomicPickReport:
 
 @dataclass(frozen=True)
 class AtomicPlaceReport:
+    success: bool
+    stages: tuple[str, ...]
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class AtomicTransferPlan:
+    """Six prevalidated TCP waypoints frozen before robot motion begins."""
+
+    pregrasp: np.ndarray
+    grasp: np.ndarray
+    lift: np.ndarray
+    preplace: np.ndarray
+    release: np.ndarray
+    home: np.ndarray
+
+    def __post_init__(self) -> None:
+        for field in (
+            "pregrasp",
+            "grasp",
+            "lift",
+            "preplace",
+            "release",
+            "home",
+        ):
+            value = _finite_pose(getattr(self, field), field)
+            value.setflags(write=False)
+            object.__setattr__(self, field, value)
+
+    @property
+    def waypoints(self) -> tuple[np.ndarray, ...]:
+        return (
+            self.pregrasp,
+            self.grasp,
+            self.lift,
+            self.preplace,
+            self.release,
+            self.home,
+        )
+
+
+@dataclass(frozen=True)
+class AtomicTransferReport:
     success: bool
     stages: tuple[str, ...]
     failure_reason: str | None = None
@@ -100,13 +139,170 @@ class PandaAtomicPickPlaceSkill:
         self.grasp_depth_offset_m = float(grasp_depth_offset_m)
         self._tool_orientation: np.ndarray | None = None
 
-    def pick(self, instance_id: str, world_from_ee: object) -> AtomicPickReport:
+    def _pick_waypoints(
+        self, world_from_ee: object
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         grasp = _finite_pose(world_from_ee, "world_from_ee").copy()
         grasp[:3, 3] += grasp[:3, 2] * self.grasp_depth_offset_m
         pregrasp = grasp.copy()
         pregrasp[:3, 3] -= grasp[:3, 2] * self.pregrasp_height_m
         lift = grasp.copy()
         lift[2, 3] += self.lift_height_m
+        return pregrasp, grasp, lift
+
+    def _place_waypoints(
+        self,
+        world_position: object,
+        tool_orientation: object | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        try:
+            position = np.asarray(world_position, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ExecutionError(
+                "world_position must be a finite 3-vector"
+            ) from exc
+        if position.shape != (3,) or not np.isfinite(position).all():
+            raise ExecutionError("world_position must be a finite 3-vector")
+
+        if tool_orientation is None:
+            rotation = (
+                np.diag([1.0, -1.0, -1.0])
+                if self._tool_orientation is None
+                else self._tool_orientation
+            )
+        else:
+            try:
+                rotation = np.asarray(tool_orientation, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ExecutionError(
+                    "tool_orientation must be a finite 3x3 rotation"
+                ) from exc
+            if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
+                raise ExecutionError(
+                    "tool_orientation must be a finite 3x3 rotation"
+                )
+
+        placement = np.eye(4, dtype=np.float64)
+        placement[:3, :3] = rotation
+        placement[:3, 3] = position
+        preplace = placement.copy()
+        preplace[2, 3] += self.preplace_height_m
+        return preplace, placement
+
+    def can_pick(self, world_from_ee: object) -> bool:
+        """Return whether pregrasp, grasp, and lift all have Panda IK solutions."""
+
+        return all(
+            self.backend.can_reach(pose)
+            for pose in self._pick_waypoints(world_from_ee)
+        )
+
+    def can_place(
+        self,
+        world_position: object,
+        tool_orientation: object | None = None,
+    ) -> bool:
+        """Return whether preplace and placement both have Panda IK solutions."""
+
+        return all(
+            self.backend.can_reach(pose)
+            for pose in self._place_waypoints(world_position, tool_orientation)
+        )
+
+    def plan_transfer(
+        self,
+        world_from_ee: object,
+        nominal_world_from_release: object,
+    ) -> AtomicTransferPlan:
+        """Freeze and IK-check the complete grasp-to-release motion plan."""
+
+        nominal_grasp = _finite_pose(world_from_ee, "world_from_ee")
+        pregrasp, grasp, lift = self._pick_waypoints(nominal_grasp)
+        release = _finite_pose(
+            nominal_world_from_release, "nominal_world_from_release"
+        )
+        # The grasp-depth correction changes the actual TCP/object offset. Apply
+        # the same correction to release so the planned object center is preserved.
+        release[:3, 3] += grasp[:3, 3] - nominal_grasp[:3, 3]
+        preplace = release.copy()
+        preplace[2, 3] += self.preplace_height_m
+        home = _finite_pose(self.backend.home_pose, "home_pose")
+        plan = AtomicTransferPlan(
+            pregrasp, grasp, lift, preplace, release, home
+        )
+        if not all(self.backend.can_reach(pose) for pose in plan.waypoints):
+            raise ExecutionError("IK-unreachable atomic transfer trajectory")
+        return plan
+
+    def execute(
+        self,
+        instance_id: str,
+        plan: AtomicTransferPlan,
+        confirm_grasp: Callable[[], bool],
+    ) -> AtomicTransferReport:
+        """Execute one preplanned pick-check-transfer-release transaction."""
+
+        del instance_id
+        if not isinstance(plan, AtomicTransferPlan):
+            raise ExecutionError("plan must be an AtomicTransferPlan")
+        if not callable(confirm_grasp):
+            raise ExecutionError("confirm_grasp must be callable")
+        if not all(self.backend.can_reach(pose) for pose in plan.waypoints):
+            raise ExecutionError("IK-unreachable atomic transfer trajectory")
+
+        completed = ["home_observe"]
+        self.backend.set_gripper(1.0, self.gripper_steps, "open")
+        completed.append("open")
+        self.backend.move_ee(plan.pregrasp, self.motion_steps, "pregrasp")
+        completed.append("pregrasp")
+        self.backend.move_ee(plan.grasp, self.motion_steps, "approach")
+        completed.append("approach")
+        self.backend.set_gripper(-1.0, self.gripper_steps, "close")
+        completed.append("close")
+        self.backend.move_ee(plan.lift, self.motion_steps, "lift")
+        completed.append("lift")
+        held = confirm_grasp()
+        if not isinstance(held, bool):
+            raise ExecutionError("confirm_grasp must return a boolean")
+        completed.append("grasp_check")
+        if not held:
+            self.backend.set_gripper(
+                1.0, self.gripper_steps, "open_recover"
+            )
+            completed.append("open_recover")
+            self._move_home(plan.home)
+            completed.append("home_return")
+            self.backend.settle(self.settle_steps)
+            completed.append("settle")
+            return AtomicTransferReport(
+                False,
+                tuple(completed),
+                "VLM did not confirm a held object",
+            )
+
+        self.backend.move_ee(plan.preplace, self.motion_steps, "preplace")
+        completed.append("preplace")
+        self.backend.move_ee(plan.release, self.motion_steps, "place")
+        completed.append("place")
+        self.backend.set_gripper(
+            1.0, self.gripper_steps * 2, "open_release"
+        )
+        completed.append("open_release")
+        self.backend.move_ee(plan.preplace, self.motion_steps, "retreat")
+        completed.append("retreat")
+        self._move_home(plan.home)
+        completed.append("home_return")
+        self.backend.settle(self.settle_steps)
+        completed.append("settle")
+        return AtomicTransferReport(True, tuple(completed))
+
+    def pick(self, instance_id: str, world_from_ee: object) -> AtomicPickReport:
+        del instance_id
+        pregrasp, grasp, lift = self._pick_waypoints(world_from_ee)
+        if not all(
+            self.backend.can_reach(pose) for pose in (pregrasp, grasp, lift)
+        ):
+            raise ExecutionError("IK-unreachable pick trajectory")
 
         completed = ["home_observe"]
         self.backend.set_gripper(1.0, self.gripper_steps, "open")
@@ -117,59 +313,18 @@ class PandaAtomicPickPlaceSkill:
         completed.append("approach")
         self.backend.set_gripper(-1.0, self.gripper_steps, "close")
         completed.append("close")
-        if not self.backend.is_grasping(instance_id):
-            return AtomicPickReport(
-                False,
-                tuple(completed),
-                "target is not held after closing gripper",
-            )
         self.backend.move_ee(lift, self.motion_steps, "lift")
         completed.append("lift")
         self._tool_orientation = grasp[:3, :3].copy()
         return AtomicPickReport(True, tuple(completed))
 
-    def place(self, instance_id: str, bin_id: str) -> AtomicPlaceReport:
-        low_raw, high_raw = self.backend.bin_inner_aabb(bin_id)
-        low = np.asarray(low_raw, dtype=np.float64)
-        high = np.asarray(high_raw, dtype=np.float64)
-        if (
-            low.shape != (3,)
-            or high.shape != (3,)
-            or not np.isfinite(low).all()
-            or not np.isfinite(high).all()
-            or np.any(low >= high)
+    def place(self, instance_id: str, world_position: object) -> AtomicPlaceReport:
+        del instance_id
+        preplace, placement = self._place_waypoints(world_position)
+        if not all(
+            self.backend.can_reach(pose) for pose in (preplace, placement)
         ):
-            raise ExecutionError("bin_inner_aabb must contain ordered finite 3-vectors")
-        half_height = float(self.backend.object_half_height(instance_id))
-        if not np.isfinite(half_height) or half_height <= 0:
-            raise ExecutionError("object_half_height must be positive and finite")
-
-        placement = np.eye(4, dtype=np.float64)
-        if self._tool_orientation is not None:
-            placement[:3, :3] = self._tool_orientation
-        else:
-            placement[:3, :3] = np.diag([1.0, -1.0, -1.0])
-        placement[:2, 3] = (low[:2] + high[:2]) / 2.0
-        placement[2, 3] = low[2] + half_height + self.placement_clearance_m
-        slot_planner = getattr(self.backend, "placement_object_center", None)
-        if callable(slot_planner):
-            center = np.asarray(
-                slot_planner(instance_id, bin_id, placement[:3, 3].copy()),
-                dtype=np.float64,
-            )
-            if center.shape != (3,) or not np.isfinite(center).all():
-                raise ExecutionError(
-                    "placement_object_center must return a finite 3-vector"
-                )
-            placement[:3, 3] = center
-        offset_planner = getattr(self.backend, "placement_ee_pose", None)
-        if callable(offset_planner):
-            placement = _finite_pose(
-                offset_planner(instance_id, bin_id, placement[:3, 3].copy()),
-                "offset-aware placement pose",
-            )
-        preplace = placement.copy()
-        preplace[2, 3] += self.preplace_height_m
+            raise ExecutionError("IK-unreachable place trajectory")
 
         completed: list[str] = []
         self.backend.move_ee(preplace, self.motion_steps, "preplace")
@@ -188,6 +343,9 @@ class PandaAtomicPickPlaceSkill:
 
     def return_home(self) -> None:
         home = _finite_pose(self.backend.home_pose, "home_pose")
+        self._move_home(home)
+
+    def _move_home(self, home: np.ndarray) -> None:
         self.backend.move_ee(home, self.motion_steps * 2, "home_return")
 
     def recover_after_failed_pick(self) -> None:
@@ -195,6 +353,7 @@ class PandaAtomicPickPlaceSkill:
 
         self.backend.set_gripper(1.0, self.gripper_steps, "open_recover")
         self.return_home()
+        self.backend.settle(self.settle_steps)
 
 
 def _as_pose_matrix(pose: object) -> np.ndarray:
@@ -279,6 +438,7 @@ class PandaDeltaPoseBackend:
         *,
         translation_tolerance_m: float = 0.01,
         rotation_tolerance_rad: float = 0.05,
+        transport_tool_axis_tolerance_rad: float = 0.15,
         placement_xy_tolerance_m: float = 0.02,
         placement_vertical_tolerance_m: float = 0.04,
         render_callback: Callable[[], object] | None = None,
@@ -301,6 +461,13 @@ class PandaDeltaPoseBackend:
             raise ExecutionError("translation_tolerance_m must be positive and finite")
         if not np.isfinite(rotation_tolerance_rad) or rotation_tolerance_rad <= 0:
             raise ExecutionError("rotation_tolerance_rad must be positive and finite")
+        if (
+            not np.isfinite(transport_tool_axis_tolerance_rad)
+            or transport_tool_axis_tolerance_rad <= 0
+        ):
+            raise ExecutionError(
+                "transport_tool_axis_tolerance_rad must be positive and finite"
+            )
         for field, value in (
             ("placement_xy_tolerance_m", placement_xy_tolerance_m),
             ("placement_vertical_tolerance_m", placement_vertical_tolerance_m),
@@ -309,6 +476,9 @@ class PandaDeltaPoseBackend:
                 raise ExecutionError(f"{field} must be positive and finite")
         self.translation_tolerance_m = float(translation_tolerance_m)
         self.rotation_tolerance_rad = float(rotation_tolerance_rad)
+        self.transport_tool_axis_tolerance_rad = float(
+            transport_tool_axis_tolerance_rad
+        )
         self.placement_xy_tolerance_m = float(placement_xy_tolerance_m)
         self.placement_vertical_tolerance_m = float(
             placement_vertical_tolerance_m
@@ -343,6 +513,43 @@ class PandaDeltaPoseBackend:
         if self.render_callback is not None:
             self.render_callback()
 
+    def can_reach(self, target_pose: np.ndarray) -> bool:
+        """Check Panda IK using only its current qpos, root pose, and URDF model."""
+
+        try:
+            import sapien
+            from mani_skill.utils.structs.pose import Pose
+
+            target = _finite_pose(target_pose, "IK target pose")
+            world_from_root = _as_pose_matrix(self.agent.robot.root.pose)
+            root_from_target = np.linalg.inv(world_from_root) @ target
+            arm_controller = self.agent.controller.controllers["arm"]
+            result = arm_controller.kinematics.compute_ik(
+                pose=Pose.create(
+                    sapien.Pose(root_from_target),
+                    device=self.agent.robot.device,
+                ),
+                q0=self.agent.robot.get_qpos(),
+            )
+        except (
+            AttributeError,
+            ExecutionError,
+            ImportError,
+            KeyError,
+            np.linalg.LinAlgError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            return False
+        if result is None:
+            return False
+        if hasattr(result, "detach"):
+            value = result.detach().cpu().numpy()
+        else:
+            value = np.asarray(result)
+        return bool(value.size and np.isfinite(value).all())
+
     def move_ee(self, target_pose: np.ndarray, steps: int, stage: str) -> None:
         target = _finite_pose(target_pose, f"{stage} target pose")
         count = _positive_int(steps, "steps")
@@ -368,6 +575,21 @@ class PandaDeltaPoseBackend:
                 _euler_xyz(target[:3, :3] @ actual[:3, :3].T)
             )
         )
+        target_tool_axis = target[:3, 2]
+        actual_tool_axis = actual[:3, 2]
+        tool_axis_error = float(
+            np.arccos(
+                np.clip(
+                    np.dot(target_tool_axis, actual_tool_axis)
+                    / (
+                        np.linalg.norm(target_tool_axis)
+                        * np.linalg.norm(actual_tool_axis)
+                    ),
+                    -1.0,
+                    1.0,
+                )
+            )
+        )
         translation_reached = translation_error <= self.translation_tolerance_m
         if stage == "preplace":
             translation_reached = (
@@ -375,21 +597,43 @@ class PandaDeltaPoseBackend:
             )
         elif stage == "place":
             translation_reached = (
-                xy_error <= self.placement_xy_tolerance_m
-                and -self.translation_tolerance_m
-                <= vertical_residual
-                <= self.placement_vertical_tolerance_m
+                xy_error
+                <= min(
+                    self.placement_xy_tolerance_m,
+                    self.translation_tolerance_m,
+                )
+                and abs(vertical_residual)
+                <= min(
+                    self.placement_vertical_tolerance_m,
+                    self.translation_tolerance_m,
+                )
             )
         allow_pick_rotation_residual = stage in {"pregrasp", "approach"}
+        vertical_transport_stage = stage in {
+            "lift",
+            "preplace",
+            "place",
+            "retreat",
+        }
+        orientation_error = (
+            tool_axis_error if vertical_transport_stage else rotation_error
+        )
+        orientation_tolerance = (
+            self.transport_tool_axis_tolerance_rad
+            if vertical_transport_stage
+            else self.rotation_tolerance_rad
+        )
         if not translation_reached or (
             not allow_pick_rotation_residual
-            and rotation_error > self.rotation_tolerance_rad
+            and orientation_error > orientation_tolerance
         ):
-            raise ExecutionError(
+            raise MotionStageError(
+                stage,
                 f"{stage} failed to reach target: translation error "
                 f"{translation_error:.6f} m (xy {xy_error:.6f} m, "
                 f"z residual {vertical_residual:.6f} m), rotation error "
-                f"{rotation_error:.6f} rad"
+                f"{rotation_error:.6f} rad, tool-axis error "
+                f"{tool_axis_error:.6f} rad"
             )
 
     def set_gripper(self, value: float, steps: int, stage: str) -> None:
@@ -400,102 +644,6 @@ class PandaDeltaPoseBackend:
             action = np.zeros(7, dtype=np.float32)
             action[6] = self.gripper_value
             self._step(action, stage)
-
-    def is_grasping(self, instance_id: str) -> bool:
-        try:
-            actor = self.base_env.semantic_actors[instance_id]
-        except KeyError as exc:
-            raise ExecutionError(f"unknown semantic actor: {instance_id}") from exc
-        value = self.agent.is_grasping(actor)
-        if hasattr(value, "detach"):
-            return bool(value[0].detach().cpu().item())
-        return bool(np.asarray(value).reshape(-1)[0])
-
-    def bin_inner_aabb(self, bin_id: str) -> tuple[np.ndarray, np.ndarray]:
-        try:
-            low, high = self.base_env.bin_inner_aabbs[bin_id]
-        except KeyError as exc:
-            raise ExecutionError(f"unknown destination bin: {bin_id}") from exc
-        return np.asarray(low).copy(), np.asarray(high).copy()
-
-    def object_half_height(self, instance_id: str) -> float:
-        try:
-            return float(self.base_env.object_half_heights[instance_id])
-        except KeyError as exc:
-            raise ExecutionError(f"unknown graspable object: {instance_id}") from exc
-
-    def placement_ee_pose(
-        self,
-        instance_id: str,
-        bin_id: str,
-        desired_object_center: np.ndarray,
-    ) -> np.ndarray:
-        del bin_id
-        desired = np.asarray(desired_object_center, dtype=np.float64)
-        if desired.shape != (3,) or not np.isfinite(desired).all():
-            raise ExecutionError("desired_object_center must be a finite 3-vector")
-        try:
-            actor_center = self.base_env.semantic_actors[instance_id].pose.p[0]
-        except KeyError as exc:
-            raise ExecutionError(f"unknown graspable object: {instance_id}") from exc
-        if hasattr(actor_center, "detach"):
-            actor_center = actor_center.detach().cpu().numpy()
-        current_center = np.asarray(actor_center, dtype=np.float64)
-        target = _as_pose_matrix(self.agent.tcp_pose)
-        target[:3, 3] += desired - current_center
-        return target
-
-    def placement_object_center(
-        self,
-        instance_id: str,
-        bin_id: str,
-        default_center: np.ndarray,
-    ) -> np.ndarray:
-        """Choose a separated XY slot when the destination already has objects."""
-
-        desired = np.asarray(default_center, dtype=np.float64)
-        if desired.shape != (3,) or not np.isfinite(desired).all():
-            raise ExecutionError("default_center must be a finite 3-vector")
-        low, high = self.bin_inner_aabb(bin_id)
-        span_xy = high[:2] - low[:2]
-        bin_center_xy = (low[:2] + high[:2]) / 2.0
-        offsets = np.asarray(
-            [
-                [0.0, 0.0],
-                [-0.28, -0.28],
-                [0.28, -0.28],
-                [-0.28, 0.28],
-                [0.28, 0.28],
-            ],
-            dtype=np.float64,
-        )
-        slots = bin_center_xy + offsets * span_xy
-        occupied: list[np.ndarray] = []
-        for other_id, actor in self.base_env.semantic_actors.items():
-            if other_id in {instance_id, bin_id}:
-                continue
-            center = actor.pose.p[0]
-            if hasattr(center, "detach"):
-                center = center.detach().cpu().numpy()
-            point = np.asarray(center, dtype=np.float64)
-            if (
-                point.shape == (3,)
-                and np.all(point[:2] >= low[:2])
-                and np.all(point[:2] <= high[:2])
-                and point[2] >= low[2]
-            ):
-                occupied.append(point[:2])
-        result = desired.copy()
-        if not occupied:
-            result[:2] = slots[0]
-            return result
-        occupied_xy = np.asarray(occupied)
-        clearances = np.min(
-            np.linalg.norm(slots[:, None, :] - occupied_xy[None, :, :], axis=2),
-            axis=1,
-        )
-        result[:2] = slots[int(np.argmax(clearances))]
-        return result
 
     def settle(self, steps: int) -> None:
         for _ in range(_positive_int(steps, "steps")):

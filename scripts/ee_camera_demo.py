@@ -460,7 +460,7 @@ def main(args: argparse.Namespace) -> None:
         "EECameraScene-v1",
         robot_uids=robot_uid,
         control_mode="pd_ee_delta_pose",
-        obs_mode="rgb+depth+segmentation",
+        obs_mode="rgb+depth",
 
         reward_mode="none",
 

@@ -196,11 +196,20 @@ def _expect_type(data: Mapping[str, Any], expected: str) -> None:
         )
 
 
+def _safe_bbox(x1: float, y1: float, x2: float, y2: float) -> BBox:
+    """Clamp a model bbox to the image while preserving strict ordering."""
+    x1 = max(0.0, min(1.0, float(x1)))
+    y1 = max(0.0, min(1.0, float(y1)))
+    x2 = max(0.0, min(1.0, float(x2)))
+    y2 = max(0.0, min(1.0, float(y2)))
+    return BBox(x1, y1, x2, y2)
+
+
 def _bbox(value: Any, field: str) -> BBox:
     if not isinstance(value, list) or len(value) != 4:
         raise ModelResponseError(f"{field} must be a four-value list")
     try:
-        return BBox(*(float(item) for item in value))
+        return _safe_bbox(*(float(item) for item in value))
     except (TypeError, ValueError) as exc:
         raise ModelResponseError(f"{field}: {exc}") from exc
 
@@ -213,11 +222,9 @@ def _object_bbox(value: Mapping[str, Any], field: str) -> BBox:
             cy = float(center["cy"])
             width = float(center["width"])
             height = float(center["height"])
-            return BBox(
-                max(0.0, cx - width / 2),
-                max(0.0, cy - height / 2),
-                min(1.0, cx + width / 2),
-                min(1.0, cy + height / 2),
+            return _safe_bbox(
+                cx - width / 2, cy - height / 2,
+                cx + width / 2, cy + height / 2,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ModelResponseError(f"{field}: {exc}") from exc
@@ -235,6 +242,9 @@ def object_bbox(value: Mapping[str, Any], field: str) -> BBox:
 class OllamaQwenVLClient:
     provider_name = "ollama-qwen-vl"
 
+    # Shared opener that bypasses system proxy — Ollama is always localhost.
+    _opener: object | None = None
+
     def __init__(
         self,
         config: RuntimeConfig,
@@ -245,11 +255,16 @@ class OllamaQwenVLClient:
         self.config = config
         self.timeout = timeout
         self._transport = transport or self._http_transport
+        if OllamaQwenVLClient._opener is None:
+            proxy_handler = request.ProxyHandler({})
+            OllamaQwenVLClient._opener = request.build_opener(proxy_handler)
 
     @staticmethod
     def _http_transport(
         url: str, payload: dict[str, Any], timeout: float
     ) -> Mapping[str, Any]:
+        import time as _time_module
+
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         http_request = request.Request(
             url,
@@ -257,11 +272,18 @@ class OllamaQwenVLClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with request.urlopen(http_request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (error.URLError, error.HTTPError, TimeoutError, OSError) as exc:
-            raise OllamaUnavailableError(f"Ollama request failed: {exc}") from exc
+        last_exc: Exception | None = None
+        opener = OllamaQwenVLClient._opener or request.build_opener(request.ProxyHandler({}))
+        for attempt in range(3):
+            try:
+                with opener.open(http_request, timeout=timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except (error.URLError, error.HTTPError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                if attempt < 2:
+                    _time_module.sleep(0.5 * (attempt + 1))
+                continue
+        raise OllamaUnavailableError(f"Ollama request failed: {last_exc}") from last_exc
 
     def _chat(
         self,
